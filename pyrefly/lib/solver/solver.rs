@@ -17,6 +17,7 @@ use std::fmt::Display;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::mem;
+use std::sync::Arc;
 
 use itertools::Either;
 use itertools::Itertools;
@@ -73,6 +74,7 @@ use crate::types::simplify::simplify_tuples;
 use crate::types::simplify::unions;
 use crate::types::simplify::unions_with_literals;
 use crate::types::typed_dict::TypedDict;
+use crate::types::typed_dict::TypedDictField;
 use crate::types::types::TParams;
 use crate::types::types::Type;
 use crate::types::types::Var;
@@ -1083,6 +1085,10 @@ pub struct Solver {
     /// Cross-call cache for TypedDict subset results.
     /// Like protocol_cache, only caches Var-free types.
     typed_dict_cache: Mutex<HashMap<(TypedDict, TypedDict), Result<(), SubsetError>>>,
+    /// Cross-call cache for instantiated TypedDict field maps; like protocol_cache, only caches
+    /// Var-free TypedDicts. Keys carry no version, so staleness is instead ruled out by lifetime:
+    /// the owning `Answers` is dropped when this module or a class it depends on changes.
+    typed_dict_fields_cache: Mutex<HashMap<TypedDict, Arc<SmallMap<Name, TypedDictField>>>>,
     pub infer_with_first_use: bool,
     pub heap: TypeHeap,
     pub tensor_shapes: bool,
@@ -1155,6 +1161,7 @@ impl Solver {
             instantiation_errors: Default::default(),
             protocol_cache: Default::default(),
             typed_dict_cache: Default::default(),
+            typed_dict_fields_cache: Default::default(),
             infer_with_first_use,
             heap: TypeHeap::new(),
             tensor_shapes,
@@ -1167,6 +1174,12 @@ impl Solver {
 
     pub fn recurse<'a>(&self, var: Var, recurser: &'a VarRecurser) -> Option<Guard<'a, Var>> {
         self.variables.lock().recurse(var, recurser)
+    }
+
+    /// Whether a result computed now may be stored in one of the caches above. SCC-local answers
+    /// are provisional until the SCC converges: they may *use* cached results, but not store them.
+    fn can_cache<Ans: LookupAnswer>(type_order: TypeOrder<'_, Ans>) -> bool {
+        !type_order.has_active_scc()
     }
 
     /// Look up a cached protocol conformance result.
@@ -1185,14 +1198,11 @@ impl Solver {
         result: &Result<(), SubsetError>,
         type_order: TypeOrder<'_, Ans>,
     ) {
-        // SCC-local answers are provisional until the SCC converges. They may use
-        // stable cached results, but must not publish results to a persistent cache.
-        if type_order.has_active_scc() {
-            return;
+        if Self::can_cache(type_order) {
+            self.protocol_cache
+                .lock()
+                .insert((got.clone(), want.clone()), result.clone());
         }
-        self.protocol_cache
-            .lock()
-            .insert((got.clone(), want.clone()), result.clone());
     }
 
     pub fn check_typed_dict_cache(
@@ -1213,14 +1223,41 @@ impl Solver {
         result: &Result<(), SubsetError>,
         type_order: TypeOrder<'_, Ans>,
     ) {
-        // SCC-local answers are provisional until the SCC converges. They may use
-        // stable cached results, but must not publish results to a persistent cache.
-        if type_order.has_active_scc() {
-            return;
+        if Self::can_cache(type_order) {
+            self.typed_dict_cache
+                .lock()
+                .insert((got.clone(), want.clone()), result.clone());
         }
-        self.typed_dict_cache
-            .lock()
-            .insert((got.clone(), want.clone()), result.clone());
+    }
+
+    pub fn check_typed_dict_fields_cache(
+        &self,
+        td: &TypedDict,
+    ) -> Option<Arc<SmallMap<Name, TypedDictField>>> {
+        self.typed_dict_fields_cache.lock().get(td).cloned()
+    }
+
+    pub fn store_typed_dict_fields_cache<Ans: LookupAnswer>(
+        &self,
+        td: &TypedDict,
+        fields: &Arc<SmallMap<Name, TypedDictField>>,
+        type_order: TypeOrder<'_, Ans>,
+    ) {
+        if Self::can_cache(type_order) {
+            debug_assert!(
+                td.is_context_independent(),
+                "store_typed_dict_fields_cache called with generic or anonymous TypedDict"
+            );
+            debug_assert!(
+                !fields
+                    .values()
+                    .any(|field| field.ty.any(|ty| matches!(ty, Type::Var(_)))),
+                "cached TypedDict field map contains a Var, so it is not context-independent"
+            );
+            self.typed_dict_fields_cache
+                .lock()
+                .insert(td.clone(), fields.clone());
+        }
     }
 
     /// Force all non-recursive Vars in `vars`.
